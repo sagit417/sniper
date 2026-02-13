@@ -1,0 +1,180 @@
+/bsc-sniper-bot
+├── .env                # Stores sensitive data (Private Keys, Node URLs) - NEVER commit this to GitHub
+├── package.json        # Dependencies
+├── src
+│   ├── index.js        # Entry point
+│   ├── monitor.js      # Logic to listen to the Mempool
+│   ├── executor.js     # Logic to construct and sign the transaction
+│   └── simulator.js    # Logic to simulate the trade (check for honeypots)
+└── abi
+    └── router.json     # The interface for the DEX (e.g., PancakeSwap)
+    PRIVATE_KEY=your_private_key_here
+WSS_NODE_URL=wss://your-private-node-provider.com
+require('dotenv').config();
+const { ethers } = require('ethers');
+
+// Configuration
+const WSS_URL = process.env.WSS_NODE_URL;
+const TARGET_ROUTER = '0x10ED43C718714eb63d5aA57B78B54704E256024E'; // PancakeSwap Router
+
+const startMonitor = async () => {
+    try {
+        const provider = new ethers.providers.WebSocketProvider(WSS_URL);
+        
+        console.log(`Listening for pending transactions on BSC...`);
+
+        provider.on('pending', async (txHash) => {
+            try {
+                // Fetch the full transaction details
+                const tx = await provider.getTransaction(txHash);
+
+                // Filter: Check if tx exists and interacts with the target router
+                if (tx && tx.to === TARGET_ROUTER) {
+                    console.log(`[Target Interaction] Hash: ${txHash}`);
+                    console.log(` - Gas Price: ${ethers.utils.formatUnits(tx.gasPrice, 'gwei')} Gwei`);
+                    
+                    // Further analysis would go here (e.g., decoding input data)
+                }
+            } catch (err) {
+                // Transactions often disappear or fail, causing fetch errors
+            }
+        });
+
+        // Handle connection errors
+        provider._websocket.on('error', async () => {
+            console.log('WebSocket error. Reconnecting...');
+            // In a production bot, you would implement reconnection logic here
+        });
+
+    } catch (error) {
+        console.error("Initialization Error:", error);
+    }
+};
+
+startMonitor();
+const ethers = require('ethers');
+
+// The function signature for addLiquidityETH
+const iface = new ethers.utils.Interface([
+    'function addLiquidityETH(address token, uint amountTokenDesired, uint amountTokenMin, uint amountETHMin, address to, uint deadline)'
+]);
+
+function analyzeTransaction(txData) {
+    try {
+        // Attempt to decode the data
+        const decoded = iface.parseTransaction({ data: txData });
+        console.log("Method detected:", decoded.name);
+        console.log("Token Address:", decoded.args.token);
+    } catch (error) {
+        // Data didn't match the function signature
+    }
+}
+// executor.js
+const { ethers } = require('ethers');
+
+// PancakeSwap V2 Router Address (Standard for BSC)
+const ROUTER_ADDRESS = '0x10ED43C718714eb63d5aA57B78B54704E256024E';
+
+// WBNB Address (Used as the path for buying)
+const WBNB_ADDRESS = '0xbb4CdB9CBd36B01bD1cBaEBF2De08d9173bc095c';
+
+const ROUTER_ABI = [
+    'function swapExactETHForTokens(uint amountOutMin, address[] calldata path, address to, uint deadline) external payable returns (uint[] memory amounts)',
+    'function getAmountsOut(uint amountIn, address[] memory path) public view returns (uint[] memory amounts)'
+];
+
+const ERC20_ABI = [
+    'function approve(address spender, uint256 amount) external returns (bool)'
+];
+
+class Executor {
+    constructor(privateKey, providerUrl) {
+        this.provider = new ethers.JsonRpcProvider(providerUrl);
+        this.wallet = new ethers.Wallet(privateKey, this.provider);
+        this.router = new ethers.Contract(ROUTER_ADDRESS, ROUTER_ABI, this.wallet);
+    }
+
+    /**
+     * The Main Sniper Function
+     * @param {string} tokenAddress - The contract address of the token you want to buy
+     * @param {string} amountInETH - How much BNB to spend (e.g., "0.1")
+     * @param {number} gasTipGwei - Extra gas to pay to be faster (e.g., 5)
+     */
+    async buyToken(tokenAddress, amountInETH, gasTipGwei = 5) {
+        try {
+            console.log(`\n=== PREPARING ATTACK: ${tokenAddress} ===`);
+            
+            const amountIn = ethers.parseEther(amountInETH);
+            const path = [WBNB_ADDRESS, tokenAddress];
+            const deadline = Math.floor(Date.now() / 1000) + 60 * 10; // 10 minutes from now
+
+            // 1. GAS CALCULATION
+            // In a sniper, speed is everything. We get the current gas price and add a "tip".
+            const feeData = await this.provider.getFeeData();
+            const buyGasPrice = feeData.gasPrice + ethers.parseUnits(gasTipGwei.toString(), 'gwei');
+
+            console.log(`Target Gas Price: ${ethers.formatUnits(buyGasPrice, 'gwei')} Gwei`);
+
+            // 2. EXECUTE SWAP
+            // amountOutMin is set to 0. This means "accept any amount of tokens".
+            // DANGER: This allows 100% slippage (you could lose money if price spikes instantly).
+            // Professional bots calculate this dynamically, but 0 is standard for "speed at all costs".
+            
+            console.log("Sending Transaction...");
+            
+            const tx = await this.router.swapExactETHForTokens(
+                0, // amountOutMin (Slippage: Infinity)
+                path,
+                this.wallet.address, // Send tokens to your wallet
+                deadline,
+                {
+                    value: amountIn,
+                    gasPrice: buyGasPrice,
+                    gasLimit: 500000 // Fixed high limit to prevent "Out of Gas" errors
+                }
+            );
+
+            console.log(`Transaction Sent! Hash: ${tx.hash}`);
+            
+            // 3. WAIT FOR RECEIPT
+            const receipt = await tx.wait();
+            console.log(`✅ Buy Confirmed in Block: ${receipt.blockNumber}`);
+            
+            // 4. AUTO-APPROVE (Important for selling later!)
+            await this.approveToken(tokenAddress);
+            
+        } catch (error) {
+            console.error("❌ BUY FAILED:", error.message);
+        }
+    }
+
+    async approveToken(tokenAddress) {
+        try {
+            console.log("Approving token for sale...");
+            const tokenContract = new ethers.Contract(tokenAddress, ERC20_ABI, this.wallet);
+            
+            // Approve PancakeSwap to spend max tokens (needed to sell)
+            const tx = await tokenContract.approve(ROUTER_ADDRESS, ethers.MaxUint256);
+            await tx.wait();
+            console.log("✅ Token Approved!");
+        } catch (error) {
+            console.error("Approval Failed:", error.message);
+        }
+    }
+}
+
+module.exports = Executor;
+// index.js
+require('dotenv').config();
+const Executor = require('./executor');
+
+// Initialize with your secrets
+const bot = new Executor(process.env.PRIVATE_KEY, process.env.RPC_URL);
+
+// --- SIMULATED TRIGGER ---
+// In a real bot, this 'tokenToSnipe' comes from your Mempool Listener (monitor.js)
+const tokenToSnipe = "0x..."; // The new token address you found
+const amountToBuy = "0.05"; // 0.05 BNB
+
+// Execute the buy
+bot.buyToken(tokenToSnipe, amountToBuy);
